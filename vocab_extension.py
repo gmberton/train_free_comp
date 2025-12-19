@@ -1,6 +1,51 @@
+
+"""This is the simple version that just finds common pairs and saves them.
+One issue is finding "concatenated" pairs like this
+"Could you"
+" you provide"
+" provide a"
+"""
+import torch
+import random
+from tqdm import tqdm
+from collections import Counter
+from datasets import load_dataset
+from transformers import AutoTokenizer
+
+TOKENIZER_NAME = "Qwen/Qwen3-0.6B"
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+dataset_infinity_instruct = load_dataset("BAAI/Infinity-Instruct", "0625", trust_remote_code=True)
+
+pairs = []
+triplets = []
+subset = 659808  # up to 659808
+for sample in tqdm(dataset_infinity_instruct['train'].select(random.sample(range(659808), subset)), desc="Creating Q-A pairs", ncols=100):
+    question, answer = sample['conversations'][:2]
+    q_tkns = tokenizer.encode(question['value'])
+    for i in range(len(q_tkns) - 1):
+        pairs.append((q_tkns[i], q_tkns[i+1]))
+
+pcnt = Counter(pairs)
+pcnt = sorted(list(pcnt.items()), key=lambda x: -x[1])
+len(pcnt)
+pcnt = [(pair, count) for pair, count in pcnt if count > 10]
+len(pcnt)
+
+print("5 most common pairs")
+for i in range(5):
+    print(tokenizer.decode(pcnt[i][0]))
+
+print(f"Saving dict with {len(pcnt)} entries")
+model_name_safe = TOKENIZER_NAME.replace("/", "-")
+torch.save(pcnt, "data/simple_extended_tok_{model_name_safe}.pth")
+
+
+"""
+# This script computes does actual BPE. It is much slower and at the end saves the tokenizer object
+
 # Hyperparameters
-TOKENIZER_NAME = "google/gemma-3-270m-it"
-NUM_TOKENS_TO_GENERATE = 10000
+TOKENIZER_NAME = "Qwen/Qwen3-4B"
+NUM_TOKENS_TO_GENERATE = 100
 NUM_QUESTIONS = 65980  # max 659808
 
 import random
@@ -122,3 +167,4 @@ logger.info(f"Final tokenizer:                {verified_token_count:,} tokens")
 logger.info(f"Verification (merged count):    {final_token_count:,} tokens (diff: {abs(final_token_count - verified_token_count):,})")
 logger.info(f"Decrease with {NUM_TOKENS_TO_GENERATE:>5} new tokens: {decrease:,} tokens ({decrease_percent:.2f}%)")
 logger.info("="*80)
+"""
