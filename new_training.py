@@ -1,4 +1,7 @@
 
+# TODO remove the check_is_subsequence filter (ideally train also those and then see if they're good or not)
+# TODO add KL
+
 import torch
 import wandb
 import random
@@ -11,14 +14,15 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import evals
 from utils_commons import make_deterministic, initialize_logger
 
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 # parser.add_argument('--llm_name', type=str, default="google/gemma-3-4b-it", help='_')
 # parser.add_argument('--extended_tokenizer_path', type=str, default="./data/extended_tokenizer_google-gemma-3-270m-it_100tokens", help='_')
-parser.add_argument('--llm_name', type=str, default="Qwen/Qwen3-0.6B", help='_')
+parser.add_argument('--llm_name', type=str, default="Qwen/Qwen3-4B", help='_')
 parser.add_argument('--extended_tokenizer_path', type=str, default="./data/extended_tokenizer_Qwen-Qwen3-4B_100tokens", help='_')
-parser.add_argument('-nq', '--num_questions', type=int, default=100000, help='max 659808')
+parser.add_argument('-nq', '--num_questions', type=int, default=659808, help='max 659808')
 parser.add_argument('-bs', '--batch_size', type=int, default=4, help='_')
 parser.add_argument('-ne', '--num_epochs', type=int, default=10, help='_')
 parser.add_argument('-ipe', '--num_iters_per_epoch', type=int, default=1000, help='_')
@@ -27,7 +31,9 @@ parser.add_argument('--device', type=str, default="cuda", help='_')
 parser.add_argument('--max_combined_chars', type=int, default=3000, help='Q&A longer than this will be filtered out')
 parser.add_argument("--exp_name", type=str, default="default", help="_")
 parser.add_argument("--nowb", action="store_true", help="no wandb logging")
+parser.add_argument("-dt", "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"], help="_")
 args = parser.parse_args()
+args.dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 args.num_questions = min(args.num_questions, 659808)
 
 log_dir = initialize_logger(exp_name=args.exp_name, stdout='INFO')
@@ -59,7 +65,28 @@ for sample in tqdm(dataset_infinity_instruct['train'].select(random.sample(range
 
 tmp = len(all_pairs)
 all_pairs = [(q, a) for q, a in tqdm(all_pairs, desc="Filtering", ncols=100) if len(set(new_token_ids).intersection(set(new_tokenizer.encode(q)))) != 0]
-logger.info(f"Out of {args.num_questions} Q&A pairs, of which {tmp} were selected, keeping only the {len(all_pairs)} that contain new tokens")
+logger.info(f"Out of {args.num_questions} Q&A pairs, of which {tmp} were not too long, keeping only the {len(all_pairs)} that contain new tokens")
+new_pairs = []
+def check_is_subsequence(short, long):
+    # it = iter(long)
+    # return [x for x in short if x not in it]
+    i = 0
+    for x in long:
+        if i < len(short) and x == short[i]:
+            i += 1
+    return short[i:]
+
+for aa, qq in tqdm(all_pairs, desc="Keep cleanly tokenized tokens", ncols=100):
+    # This loop removes sentences that did not tokenize "cleanly", meaning that do not lead to the creation of extra tokens.
+    # For example the phrase ', then', with old tokenizer is [',', ' then'], with new is []', the', 'n']. It creates 'n', so not clean.
+    old_tkns = old_tokenizer.encode(aa)
+    new_tkns = new_tokenizer.encode(aa)
+    new_old_tkns = [tkn for tkn in new_tkns if tkn not in new_token_ids]
+    if len(check_is_subsequence(new_old_tkns, old_tkns)) == 0:
+        new_pairs.append((aa, qq))
+
+all_pairs = new_pairs
+logger.info(f"Finally kept {len(all_pairs)} that tokenize cleanly")
 
 # Split train and valid data
 random.shuffle(all_pairs)
@@ -68,7 +95,7 @@ train_all_pairs, valid_all_pairs = all_pairs[:split_idx], all_pairs[split_idx:]
 logger.info(f"Train pairs: {len(train_all_pairs)}, Val pairs: {len(valid_all_pairs)}")
 
 #### Create model. Untie weights. Expand embedding table.
-llm = AutoModelForCausalLM.from_pretrained(args.llm_name, trust_remote_code=True, torch_dtype=torch.float32).to(args.device)
+llm = AutoModelForCausalLM.from_pretrained(args.llm_name, trust_remote_code=True, torch_dtype=args.dtype).to(args.device)
 input_emb = llm.get_input_embeddings()
 model_vocab_size, hidden_dim = input_emb.weight.shape
 output_emb = llm.get_output_embeddings() if hasattr(llm, 'get_output_embeddings') else None
@@ -95,8 +122,6 @@ def sync_embeddings():  # Set learnable_embeddings into embedding table
         for token_id in new_token_ids:
             llm.get_input_embeddings().weight.data[token_id] = learnable_embeddings[token_id].data
 
-sync_embeddings()
-
 def compute_loss(batch_pairs, do_backward):
     losses = []
     for q, a in batch_pairs:
@@ -110,25 +135,25 @@ def compute_loss(batch_pairs, do_backward):
         assert len(qa_old_tkns) > len(qq_old_tkns)
         aa_old_tkns = qa_old_tkns[len(qq_old_tkns):]
         # Compute teacher logits
-        with torch.no_grad():
-            teacher_inputs_embeds = llm.get_input_embeddings()(torch.tensor(qa_old_tkns, device=args.device).reshape(1, -1))
-            teacher_logits = llm(inputs_embeds=teacher_inputs_embeds).logits
-            teacher_logits = teacher_logits[0, -len(aa_old_tkns):]  # Select only logits of answer
+        with torch.amp.autocast(device_type=str(llm.device), dtype=llm.dtype):
+            with torch.no_grad():
+                teacher_inputs_embeds = llm.get_input_embeddings()(torch.tensor(qa_old_tkns, device=args.device).reshape(1, -1))
+                teacher_logits = llm(inputs_embeds=teacher_inputs_embeds).logits
+                teacher_logits = teacher_logits[0, -len(aa_old_tkns):]  # Select only logits of answer
         # Compute student logits
         qq_new_aa_old_tkns = qq_new_tkns + aa_old_tkns
         if qa_old_tkns == qq_new_aa_old_tkns:
             # print(f"No new tokens here, continue")
             raise RuntimeError("This should never happen because I've pre-filtered Q&A pairs")  # TODO remove
         else:
-            if not len(qa_old_tkns) > len(qq_new_aa_old_tkns):
-                import ipdb; ipdb.set_trace()
             assert len(qa_old_tkns) > len(qq_new_aa_old_tkns)
             # print(f"Found {len(qa_old_tkns) - len(qq_new_aa_old_tkns)} new tokens")
         student_inputs_embeds = llm.get_input_embeddings()(torch.tensor(qq_new_aa_old_tkns, device=args.device).reshape(1, -1))
         for idx, tkn in enumerate(qq_new_aa_old_tkns):
             if tkn in new_token_ids:
                 student_inputs_embeds[0, idx] = learnable_embeddings[tkn]
-        student_logits = llm(inputs_embeds=student_inputs_embeds).logits
+        with torch.amp.autocast(device_type=str(llm.device), dtype=llm.dtype):
+            student_logits = llm(inputs_embeds=student_inputs_embeds).logits
         student_logits = student_logits[0, -len(aa_old_tkns):]  # Select only logits of answer
         loss = F.mse_loss(student_logits, teacher_logits)
         if do_backward:
@@ -139,6 +164,11 @@ def compute_loss(batch_pairs, do_backward):
     return np.mean(losses)
 
 for num_epoch in range(args.num_epochs):
+    sync_embeddings()
+    old_acc = evals.eval_gsm8k(llm, old_tokenizer)
+    new_acc = evals.eval_gsm8k(llm, new_tokenizer)
+    logger.info(f"{old_acc = }, {new_acc = }")
+    wandb.log({"new_acc": new_acc})
     tqdm_bar = tqdm(range(args.num_iters_per_epoch), ncols=100)
     train_losses, valid_losses = [], []
     for num_iter in tqdm_bar:
