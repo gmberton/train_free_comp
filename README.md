@@ -19,4 +19,23 @@ new_training.py: hand-coded. It works
 basic_training.py: hand-coded. Shows example with 20 lines train set and 2 new tokens
 
 
+TODO ABLATE:
+remove the check_is_subsequence filter (ideally train also those and then see if they're good or not)
+losses
+LRs
+MCC
+BS
+
+
+parser.add_argument("-lt", "--loss_type", type=str, default="mse", choices=['mse', 'smoothl1', 'kl', 'codi'], help="_")
+
+p new_training.py --loss_type mse --lr 0.1 --exp_name mse_0.1
+p new_training.py --loss_type smoothl1 --lr 0.1 --exp_name smoothl1_0.1
+p new_training.py --loss_type kl --lr 0.1 --exp_name kl_0.1
+p new_training.py --loss_type codi --lr 0.1 --exp_name codi_0.1
+p new_training.py --loss_type mse --lr 0.01 --exp_name mse_0.01
+p new_training.py --loss_type smoothl1 --lr 0.01 --exp_name smoothl1_0.01
+p new_training.py --loss_type kl --lr 0.01 --exp_name kl_0.01
+p new_training.py --loss_type codi --lr 0.01 --exp_name codi_0.01
+
 

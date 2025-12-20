@@ -1,7 +1,4 @@
 
-# TODO remove the check_is_subsequence filter (ideally train also those and then see if they're good or not)
-# TODO add KL
-
 import torch
 import wandb
 import random
@@ -24,25 +21,27 @@ parser.add_argument('--llm_name', type=str, default="Qwen/Qwen3-4B", help='_')
 parser.add_argument('--extended_tokenizer_path', type=str, default="./data/extended_tokenizer_Qwen-Qwen3-4B_100tokens", help='_')
 parser.add_argument('-nq', '--num_questions', type=int, default=659808, help='max 659808')
 parser.add_argument('-bs', '--batch_size', type=int, default=4, help='_')
-parser.add_argument('-ne', '--num_epochs', type=int, default=10, help='_')
+parser.add_argument('-ne', '--num_epochs', type=int, default=100, help='_')
 parser.add_argument('-ipe', '--num_iters_per_epoch', type=int, default=1000, help='_')
 parser.add_argument('--lr', type=float, default=0.1, help='_')
 parser.add_argument('--device', type=str, default="cuda", help='_')
-parser.add_argument('--max_combined_chars', type=int, default=3000, help='Q&A longer than this will be filtered out')
+parser.add_argument('-mcc', '--max_combined_chars', type=int, default=6000, help='Q&A longer than this will be filtered out')
 parser.add_argument("--exp_name", type=str, default="default", help="_")
 parser.add_argument("--nowb", action="store_true", help="no wandb logging")
 parser.add_argument("-dt", "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float32"], help="_")
+parser.add_argument("-lt", "--loss_type", type=str, default="kl", choices=['mse', 'smoothl1', 'kl', 'codi'], help="_")
 args = parser.parse_args()
 args.dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 args.num_questions = min(args.num_questions, 659808)
 
-log_dir = initialize_logger(exp_name=args.exp_name, stdout='INFO')
+VERSION = 3
+log_dir = initialize_logger(exp_name=f"v{VERSION}_{args.exp_name}", stdout='INFO')
 logger.info(f"All arguments: {args}")
 make_deterministic(2)
 if args.nowb:
     wandb.log = lambda _: None
 else:
-    run = wandb.init(project=f"tfc3", name=args.exp_name)
+    run = wandb.init(project=f"tfc{VERSION}", name=args.exp_name)
     logger.info(f"wandb: ⭐️ View project at {run.get_project_url()}")
 
 #### Create new and old tokenizers
@@ -66,31 +65,31 @@ for sample in tqdm(dataset_infinity_instruct['train'].select(random.sample(range
 tmp = len(all_pairs)
 all_pairs = [(q, a) for q, a in tqdm(all_pairs, desc="Filtering", ncols=100) if len(set(new_token_ids).intersection(set(new_tokenizer.encode(q)))) != 0]
 logger.info(f"Out of {args.num_questions} Q&A pairs, of which {tmp} were not too long, keeping only the {len(all_pairs)} that contain new tokens")
-new_pairs = []
-def check_is_subsequence(short, long):
-    # it = iter(long)
-    # return [x for x in short if x not in it]
-    i = 0
-    for x in long:
-        if i < len(short) and x == short[i]:
-            i += 1
-    return short[i:]
+# new_pairs = []
+# def check_is_subsequence(short, long):
+#     # it = iter(long)
+#     # return [x for x in short if x not in it]
+#     i = 0
+#     for x in long:
+#         if i < len(short) and x == short[i]:
+#             i += 1
+#     return short[i:]
 
-for aa, qq in tqdm(all_pairs, desc="Keep cleanly tokenized tokens", ncols=100):
-    # This loop removes sentences that did not tokenize "cleanly", meaning that do not lead to the creation of extra tokens.
-    # For example the phrase ', then', with old tokenizer is [',', ' then'], with new is []', the', 'n']. It creates 'n', so not clean.
-    old_tkns = old_tokenizer.encode(aa)
-    new_tkns = new_tokenizer.encode(aa)
-    new_old_tkns = [tkn for tkn in new_tkns if tkn not in new_token_ids]
-    if len(check_is_subsequence(new_old_tkns, old_tkns)) == 0:
-        new_pairs.append((aa, qq))
+# for aa, qq in tqdm(all_pairs, desc="Keep cleanly tokenized tokens", ncols=100):
+#     # This loop removes sentences that did not tokenize "cleanly", meaning that do not lead to the creation of extra tokens.
+#     # For example the phrase ', then', with old tokenizer is [',', ' then'], with new is []', the', 'n']. It creates 'n', so not clean.
+#     old_tkns = old_tokenizer.encode(aa)
+#     new_tkns = new_tokenizer.encode(aa)
+#     new_old_tkns = [tkn for tkn in new_tkns if tkn not in new_token_ids]
+#     if len(check_is_subsequence(new_old_tkns, old_tkns)) == 0:
+#         new_pairs.append((aa, qq))
 
-all_pairs = new_pairs
-logger.info(f"Finally kept {len(all_pairs)} that tokenize cleanly")
+# all_pairs = new_pairs
+# logger.info(f"Finally kept {len(all_pairs)} that tokenize cleanly")
 
 # Split train and valid data
 random.shuffle(all_pairs)
-split_idx = int(len(all_pairs) * 0.8)  # 80% of data is training, rest is validation
+split_idx = int(len(all_pairs) * 0.9)  # 90% of data is training, rest is validation
 train_all_pairs, valid_all_pairs = all_pairs[:split_idx], all_pairs[split_idx:]
 logger.info(f"Train pairs: {len(train_all_pairs)}, Val pairs: {len(valid_all_pairs)}")
 
@@ -138,24 +137,48 @@ def compute_loss(batch_pairs, do_backward):
         with torch.amp.autocast(device_type=str(llm.device), dtype=llm.dtype):
             with torch.no_grad():
                 teacher_inputs_embeds = llm.get_input_embeddings()(torch.tensor(qa_old_tkns, device=args.device).reshape(1, -1))
-                teacher_logits = llm(inputs_embeds=teacher_inputs_embeds).logits
-                teacher_logits = teacher_logits[0, -len(aa_old_tkns):]  # Select only logits of answer
+                teacher_outputs = llm(inputs_embeds=teacher_inputs_embeds, output_hidden_states=True)
+                teacher_logits = teacher_outputs.logits
+                teacher_hidden_states = teacher_outputs.hidden_states
         # Compute student logits
         qq_new_aa_old_tkns = qq_new_tkns + aa_old_tkns
         if qa_old_tkns == qq_new_aa_old_tkns:
             # print(f"No new tokens here, continue")
-            raise RuntimeError("This should never happen because I've pre-filtered Q&A pairs")  # TODO remove
-        else:
-            assert len(qa_old_tkns) > len(qq_new_aa_old_tkns)
-            # print(f"Found {len(qa_old_tkns) - len(qq_new_aa_old_tkns)} new tokens")
+            raise RuntimeError("This should never happen because I've pre-filtered Q&A pairs to avoid 0 loss samples")
+        # else:
+        #     # This can happen e.g. ", then" will be 2 tokens with new or old tokenizer (but different ones)
+        #     assert len(qa_old_tkns) > len(qq_new_aa_old_tkns)
         student_inputs_embeds = llm.get_input_embeddings()(torch.tensor(qq_new_aa_old_tkns, device=args.device).reshape(1, -1))
         for idx, tkn in enumerate(qq_new_aa_old_tkns):
             if tkn in new_token_ids:
                 student_inputs_embeds[0, idx] = learnable_embeddings[tkn]
         with torch.amp.autocast(device_type=str(llm.device), dtype=llm.dtype):
-            student_logits = llm(inputs_embeds=student_inputs_embeds).logits
-        student_logits = student_logits[0, -len(aa_old_tkns):]  # Select only logits of answer
-        loss = F.mse_loss(student_logits, teacher_logits)
+            student_outputs = llm(inputs_embeds=student_inputs_embeds, output_hidden_states=True)
+            student_logits = student_outputs.logits
+            student_hidden_states = student_outputs.hidden_states
+
+        # Remove logits and hidden states of non-answer tokens
+        student_logits = student_logits[:, -len(aa_old_tkns):]
+        teacher_logits = teacher_logits[:, -len(aa_old_tkns):]
+        student_hidden_states = [hstate[:, -len(aa_old_tkns):] for hstate in student_hidden_states]
+        teacher_hidden_states = [hstate[:, -len(aa_old_tkns):] for hstate in teacher_hidden_states]
+        
+        if args.loss_type == "mse":
+            loss = F.mse_loss(student_logits, teacher_logits)
+        elif args.loss_type == "smoothl1":
+            loss = F.smooth_l1_loss(student_logits, teacher_logits)
+        elif args.loss_type == "kl":
+            T = 2.0  # temperature > 1.0 softens distributions
+            student_probs = torch.nn.functional.log_softmax(student_logits / T, dim=-1)
+            teacher_probs = torch.nn.functional.softmax(teacher_logits / T, dim=-1)
+            loss = F.kl_div(student_probs, teacher_probs, reduction='batchmean') * (T * T)
+        elif args.loss_type == "codi":
+            student_hidden_states = torch.stack(student_hidden_states)
+            teacher_hidden_states = torch.stack(teacher_hidden_states)
+            std_per_layer = teacher_hidden_states.std([1,2,3]).unsqueeze(1).unsqueeze(1).unsqueeze(1)
+            loss = F.smooth_l1_loss(student_hidden_states, teacher_hidden_states, reduction="none")
+            loss = (loss / std_per_layer).mean([1,2,3]).sum()
+            
         if do_backward:
             loss.backward()
         losses.append(loss.item())
@@ -165,11 +188,14 @@ def compute_loss(batch_pairs, do_backward):
 
 for num_epoch in range(args.num_epochs):
     sync_embeddings()
-    old_acc = evals.eval_gsm8k(llm, old_tokenizer)
-    new_acc = evals.eval_gsm8k(llm, new_tokenizer)
-    logger.info(f"{old_acc = }, {new_acc = }")
-    wandb.log({"new_acc": new_acc})
-    tqdm_bar = tqdm(range(args.num_iters_per_epoch), ncols=100)
+    gsm_old_acc = evals.eval_gsm8k(llm, old_tokenizer)
+    gsm_new_acc = evals.eval_gsm8k(llm, new_tokenizer)
+    boo_old_acc = evals.eval_boolq(llm, old_tokenizer)
+    boo_new_acc = evals.eval_boolq(llm, new_tokenizer)
+    sst_old_acc = evals.eval_sst2(llm, old_tokenizer)
+    sst_new_acc = evals.eval_sst2(llm, new_tokenizer)
+    wandb.log({"gsm8k_new_acc": gsm_new_acc, "boolq_new_acc": boo_new_acc, "sst2_new_acc": sst_new_acc})
+    tqdm_bar = tqdm(range(args.num_iters_per_epoch), ncols=100, leave=False)
     train_losses, valid_losses = [], []
     for num_iter in tqdm_bar:
         train_batch_pairs = random.choices(train_all_pairs, k=args.batch_size)
@@ -182,4 +208,7 @@ for num_epoch in range(args.num_epochs):
         valid_losses.append(valid_loss)
         tqdm_bar.desc = f"train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}"
     wandb.log({"train_loss": np.mean(train_losses), "valid_loss": np.mean(valid_losses)})
-    logger.info(f"train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}")
+    logger.info(
+        f"{num_epoch=:>2}, train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}, "
+        f"GSM8k: [{gsm_old_acc}, {gsm_new_acc}], BoolQ: [{boo_old_acc}, {boo_new_acc}], SST2: [{sst_old_acc}, {sst_new_acc}], "
+    )

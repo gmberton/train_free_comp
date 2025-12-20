@@ -1,54 +1,44 @@
 
-# Hyperparameters
-TOKENIZER_NAME = "Qwen/Qwen3-4B"
-NUM_TOKENS_TO_GENERATE = 100
-NUM_QUESTIONS = 65980  # max 659808
-
-import random
-from tqdm import tqdm
-from collections import Counter
-from transformers import AutoTokenizer
-from loguru import logger
 import os
 import sys
+import random
+import argparse
+from tqdm import tqdm
+from loguru import logger
+from collections import Counter
+from transformers import AutoTokenizer
+from utils_commons import make_deterministic
+
+parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+parser.add_argument('--llm_name', type=str, default="Qwen/Qwen3-4B", help='_')
+parser.add_argument('-nt', '--num_tokens', type=int, default=100, help='How many new tokens to generate')
+args = parser.parse_args()
 
 logger.remove()
 logger.add(sys.stderr, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | {message}")
 
-random.seed(0)
+make_deterministic(0)
 os.makedirs("./data", exist_ok=True)
 
 # Load and extract questions
 from datasets import load_dataset
-dataset = load_dataset("BAAI/Infinity-Instruct", "0625", trust_remote_code=True)
+
+dataset_infinity_instruct = load_dataset("BAAI/Infinity-Instruct", "0625", trust_remote_code=True)
 questions = []
-for example in tqdm(dataset['train'].select(range(NUM_QUESTIONS)), desc="Extracting questions"):
-    if 'conversations' in example and isinstance(example['conversations'], list):
-        for conv in example['conversations']:
-            if isinstance(conv, dict):
-                content = (conv.get('value') if conv.get('from') in ['user', 'human'] 
-                          else conv.get('content') if conv.get('role') == 'user' 
-                          else conv.get('content') if 'content' in conv and conv.get('role') != 'assistant' 
-                          else '').strip()
-                if content:
-                    questions.append(content)
+for sample in tqdm(dataset_infinity_instruct['train'].select(random.sample(range(659808), args.num_questions)), desc="Creating Q-A pairs", ncols=100):
+    question, answer = sample['conversations'][:2]
+    questions.append(question['value'])
 
-# Remove duplicates
-questions = list(dict.fromkeys(q for q in questions if q))
-logger.info(f"Extracted {len(questions)} unique questions")
-
-logger.info(f"Total questions available: {len(questions)}")
-questions = questions[:NUM_QUESTIONS]
+questions = list(set(questions))
+random.shuffle(questions)
 logger.info(f"Using {len(questions)} questions for processing")
 
 # Load tokenizer
-tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-logger.success(f"Tokenizer loaded: {TOKENIZER_NAME}")
+tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
+logger.success(f"Tokenizer loaded: {args.llm_name}")
 
 # Tokenize
 def parse(contexts):
-    contexts = list(set(contexts))
-    random.shuffle(contexts)
     tokens = []
     for context in tqdm(contexts, desc="Tokenizing"):
         tokens.extend(tokenizer.encode(context, add_special_tokens=False))
@@ -72,7 +62,7 @@ def merge(ids, pair, replacement):
 
 # Find token pairs and extend vocabulary
 new_tokens_info = []
-for _ in tqdm(range(NUM_TOKENS_TO_GENERATE), desc="Finding token pairs"):
+for _ in tqdm(range(args.num_tokens), desc="Finding token pairs"):
     pairs = Counter(zip(train_tkns, train_tkns[1:]))
     if len(pairs) == 0:
         logger.error("No token pairs found! Cannot continue.")
@@ -102,8 +92,8 @@ for token_info in new_tokens_info[:20]:
     logger.info(f"{token_info['id']:<12} {token_info['count']:<8} {sub_tokens_str:<25} {text_str:<30}")
 
 # Save tokenizer
-model_name_safe = TOKENIZER_NAME.replace("/", "-")
-tokenizer_path = f"./data/extended_tokenizer_{model_name_safe}_{NUM_TOKENS_TO_GENERATE}tokens"
+model_name_safe = args.llm_name.replace("/", "-")
+tokenizer_path = f"./data/extended_tokenizer_{model_name_safe}_{args.num_tokens}tokens"
 tokenizer.save_pretrained(tokenizer_path)
 logger.success(f"Tokenizer saved to '{tokenizer_path}' directory")
 
@@ -121,5 +111,5 @@ logger.info("="*80)
 logger.info(f"Initial tokenizer:              {initial_token_count:,} tokens")
 logger.info(f"Final tokenizer:                {verified_token_count:,} tokens")
 logger.info(f"Verification (merged count):    {final_token_count:,} tokens (diff: {abs(final_token_count - verified_token_count):,})")
-logger.info(f"Decrease with {NUM_TOKENS_TO_GENERATE:>5} new tokens: {decrease:,} tokens ({decrease_percent:.2f}%)")
+logger.info(f"Decrease with {args.num_tokens:>5} new tokens: {decrease:,} tokens ({decrease_percent:.2f}%)")
 logger.info("="*80)
