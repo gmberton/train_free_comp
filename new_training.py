@@ -18,9 +18,9 @@ parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFo
 # parser.add_argument('--llm_name', type=str, default="google/gemma-3-4b-it", help='_')
 # parser.add_argument('--extended_tokenizer_path', type=str, default="./data/extended_tokenizer_google-gemma-3-270m-it_100tokens", help='_')
 parser.add_argument('--llm_name', type=str, default="Qwen/Qwen3-4B", help='_')
-parser.add_argument('--extended_tokenizer_path', type=str, default="./data/extended_tokenizer_Qwen-Qwen3-4B_100tokens", help='_')
+parser.add_argument('-nt', '--num_tokens', type=int, default=5000, help='How many new tokens to generate')
 parser.add_argument('-nq', '--num_questions', type=int, default=659808, help='max 659808')
-parser.add_argument('-bs', '--batch_size', type=int, default=4, help='_')
+parser.add_argument('-bs', '--batch_size', type=int, default=32, help='_')
 parser.add_argument('-ne', '--num_epochs', type=int, default=100, help='_')
 parser.add_argument('-ipe', '--num_iters_per_epoch', type=int, default=1000, help='_')
 parser.add_argument('--lr', type=float, default=0.1, help='_')
@@ -34,7 +34,9 @@ args = parser.parse_args()
 args.dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 args.num_questions = min(args.num_questions, 659808)
 
-VERSION = 3
+VERSION = 4
+if args.exp_name == "default":
+    args.exp_name = f"v{VERSION}_nq{args.num_questions}_bs{args.batch_size}"
 log_dir = initialize_logger(exp_name=f"v{VERSION}_{args.exp_name}", stdout='INFO')
 logger.info(f"All arguments: {args}")
 make_deterministic(2)
@@ -46,12 +48,13 @@ else:
 
 #### Create new and old tokenizers
 old_tokenizer = AutoTokenizer.from_pretrained(args.llm_name)
-new_tokenizer = AutoTokenizer.from_pretrained(args.extended_tokenizer_path, trust_remote_code=True)
+model_name_safe = args.llm_name.replace("/", "-")
+new_tokenizer = AutoTokenizer.from_pretrained(f"./data/extended_tokenizer_{model_name_safe}_{args.num_tokens}tokens", trust_remote_code=True)
 # Sanity check: ensure new tokenizer is an extension of old tokenizer
 assert len(new_tokenizer) >= len(old_tokenizer)
 assert all(old_tokenizer.convert_ids_to_tokens(i) == new_tokenizer.convert_ids_to_tokens(i) for i in range(len(old_tokenizer)))
 new_token_ids = list(range(len(old_tokenizer), len(new_tokenizer)))
-assert len(new_token_ids) == 100
+assert len(new_token_ids) == 5000, str(len(new_token_ids))
 
 #### Create data pairs
 dataset_infinity_instruct = load_dataset("BAAI/Infinity-Instruct", "0625", trust_remote_code=True)
@@ -188,13 +191,12 @@ def compute_loss(batch_pairs, do_backward):
 
 for num_epoch in range(args.num_epochs):
     sync_embeddings()
-    gsm_old_acc = evals.eval_gsm8k(llm, old_tokenizer)
-    gsm_new_acc = evals.eval_gsm8k(llm, new_tokenizer)
-    boo_old_acc = evals.eval_boolq(llm, old_tokenizer)
-    boo_new_acc = evals.eval_boolq(llm, new_tokenizer)
-    sst_old_acc = evals.eval_sst2(llm, old_tokenizer)
-    sst_new_acc = evals.eval_sst2(llm, new_tokenizer)
-    wandb.log({"gsm8k_new_acc": gsm_new_acc, "boolq_new_acc": boo_new_acc, "sst2_new_acc": sst_new_acc})
+    old_tkn_results, old_tkns_per_qst = evals.compute_evals(llm, old_tokenizer, num_samples=100)
+    new_tkn_results, new_tkns_per_qst = evals.compute_evals(llm, new_tokenizer, num_samples=100)
+    diffs = {k: old_tkn_results[k] - new_tkn_results[k] for k in new_tkn_results.keys()}
+    if num_epoch == 0:
+        logger.info(f"{old_tkns_per_qst=}, {new_tkns_per_qst=}")
+    wandb.log(diffs)
     tqdm_bar = tqdm(range(args.num_iters_per_epoch), ncols=100, leave=False)
     train_losses, valid_losses = [], []
     for num_iter in tqdm_bar:
@@ -208,7 +210,12 @@ for num_epoch in range(args.num_epochs):
         valid_losses.append(valid_loss)
         tqdm_bar.desc = f"train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}"
     wandb.log({"train_loss": np.mean(train_losses), "valid_loss": np.mean(valid_losses)})
-    logger.info(
-        f"{num_epoch=:>2}, train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}, "
-        f"GSM8k: [{gsm_old_acc}, {gsm_new_acc}], BoolQ: [{boo_old_acc}, {boo_new_acc}], SST2: [{sst_old_acc}, {sst_new_acc}], "
-    )
+    logger.info(f"{num_epoch=:>2}, train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}, {diffs}")
+
+old_tkn_results, old_tkns_per_qst = evals.compute_evals(llm, old_tokenizer, num_samples=1000)
+new_tkn_results, new_tkns_per_qst = evals.compute_evals(llm, new_tokenizer, num_samples=1000)
+diffs = {k: old_tkn_results[k] - new_tkn_results[k] for k in new_tkn_results.keys()}
+logger.info(f"FINAL RESULTS: {old_tkn_results=}")
+logger.info(f"FINAL RESULTS: {new_tkn_results=}")
+logger.info(f"FINAL RESULTS: {diffs=}")
+

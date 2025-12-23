@@ -2,9 +2,8 @@
 
 TODO
 
-use KL divergence
 there are multiple losses that could be used.
-    Distillation loss on answer logits.
+    Distillation loss on answer logits (CODI).
     Distillation on activations on answer tokens.
     Distillation on activations of all non-new tokens.
 
@@ -18,6 +17,9 @@ train.py: vibe-code. Doesn't work
 new_training.py: hand-coded. It works
 basic_training.py: hand-coded. Shows example with 20 lines train set and 2 new tokens
 
+vocab_extension_v1.py: this is proper BPE. Vibe coded
+vocab_extension_v2.py: this just finds the top N pairs of tokens in one pass. Much faster.
+    Limitations: doesn't encode triplets or quadruplets of tokens
 
 TODO ABLATE:
 remove the check_is_subsequence filter (ideally train also those and then see if they're good or not)

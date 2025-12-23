@@ -1,4 +1,5 @@
 
+import os
 import sys
 import torch
 import random
@@ -25,6 +26,7 @@ def make_deterministic(seed: int = 0):
     seed = int(seed)
     if seed == -1:
         return
+    os.environ['PYTHONHASHSEED'] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)

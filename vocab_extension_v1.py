@@ -25,7 +25,7 @@ from datasets import load_dataset
 
 dataset_infinity_instruct = load_dataset("BAAI/Infinity-Instruct", "0625", trust_remote_code=True)
 questions = []
-for sample in tqdm(dataset_infinity_instruct['train'].select(random.sample(range(659808), args.num_questions)), desc="Creating Q-A pairs", ncols=100):
+for sample in tqdm(dataset_infinity_instruct['train'], desc="Creating Q-A pairs", ncols=100):
     question, answer = sample['conversations'][:2]
     questions.append(question['value'])
 
