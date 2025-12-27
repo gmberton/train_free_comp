@@ -35,9 +35,20 @@ def make_deterministic(seed: int = 0):
     torch.backends.cudnn.benchmark = False
 
 from time import time
+from collections import defaultdict
 class Timer:
     def __init__(self):
         self.start_time = time()
+        self.d = defaultdict(float)
+        self.counts = 0
     def __call__(self, s):
-        print(f"{s}: {time() - self.start_time:.4f} seconds")
+        delta = (time() - self.start_time) * 1000
+        print(f"{s}: {int(delta):>3} ms")
         self.start_time = time()
+        self.d[s] += delta
+    def print(self):
+        self.counts += 1
+        output = ""
+        for k, delta in self.d.items():
+            output += f"| {k:>2}: {int(delta / self.counts):>3} "
+        print(output)
