@@ -16,13 +16,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 import evals
 from utils_commons import make_deterministic, initialize_logger
 
+NUM_VAL_SAMPLES = 128
+
 parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 # parser.add_argument('--llm_name', type=str, default="google/gemma-3-4b-it", help='_')
 # parser.add_argument('--extended_tokenizer_path', type=str, default="./data/extended_tokenizer_google-gemma-3-270m-it_100tokens", help='_')
 parser.add_argument('--llm_name', type=str, default="Qwen/Qwen3-4B", help='_')
 parser.add_argument('-nt', '--num_tokens', type=int, default=5000, help='How many new tokens to generate')
 parser.add_argument('-nq', '--num_questions', type=int, default=659808, help='max 659808')
-parser.add_argument('-bs', '--batch_size', type=int, default=32, help='_')
+parser.add_argument('-bs', '--batch_size', type=int, default=8, help='_')
 parser.add_argument('-ne', '--num_epochs', type=int, default=100, help='_')
 parser.add_argument('-ipe', '--num_iters_per_epoch', type=int, default=1000, help='_')
 parser.add_argument('--lr', type=float, default=0.1, help='_')
@@ -36,7 +38,7 @@ args = parser.parse_args()
 args.dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float32
 args.num_questions = min(args.num_questions, 659808)
 
-VERSION = 4
+VERSION = 5
 if args.exp_name == "default":
     args.exp_name = f"v{VERSION}_nq{args.num_questions}_bs{args.batch_size}"
 log_dir = initialize_logger(exp_name=f"v{VERSION}_{args.exp_name}", stdout='INFO')
@@ -96,9 +98,9 @@ logger.info(f"Out of {args.num_questions} Q&A pairs, of which {tmp} were not too
 
 # Split train and valid data
 random.shuffle(all_pairs)
-split_idx = int(len(all_pairs) * 0.9)  # 90% of data is training, rest is validation
-train_all_pairs, valid_all_pairs = all_pairs[:split_idx], all_pairs[split_idx:]
+valid_all_pairs, train_all_pairs = all_pairs[:NUM_VAL_SAMPLES], all_pairs[NUM_VAL_SAMPLES:]
 logger.info(f"Train pairs: {len(train_all_pairs)}, Val pairs: {len(valid_all_pairs)}")
+valid_all_pairs.sort(key=lambda qa: len(qa[0]) + len(qa[1]))  # Sort by length to speed up validation
 
 #### Create model. Untie weights. Expand embedding table.
 llm = AutoModelForCausalLM.from_pretrained(args.llm_name, trust_remote_code=True, torch_dtype=args.dtype).to(args.device)
@@ -142,7 +144,7 @@ def compute_loss(batch_pairs, do_backward):
             all_teacher_outputs = llm(**qa_old_tkns, output_hidden_states=args.loss_type=="codi")
             all_teacher_logits = all_teacher_outputs.logits
 
-    for num_sample, (q, a) in enumerate(batch_pairs):
+    for num_sample in range(len(batch_pairs)):
         sample_qq_attn_msk = qq_new_tkns.attention_mask[num_sample]
         sample_qq_new_tkns = qq_new_tkns.input_ids[num_sample][:sample_qq_attn_msk.sum()]
         # qq_chat = old_tokenizer.apply_chat_template([{"role": "user", "content": q}], tokenize=False, enable_thinking=False)
@@ -190,7 +192,7 @@ def compute_loss(batch_pairs, do_backward):
         losses.append(loss.item())
     optimizer.step()
     optimizer.zero_grad()
-    return np.mean(losses)
+    return float(np.mean(losses))
 
 bins_train_all_pairs = defaultdict(list)
 for q, a in train_all_pairs:
@@ -202,34 +204,40 @@ logger.info(f"There are {len(bins_train_all_pairs)} bins, with Q&A from length {
 
 old_tkn_results, old_tkns_per_qst = evals.compute_evals(llm, old_tokenizer, num_samples=500)
 for num_epoch in range(args.num_epochs):
-    # Select only bins with length < (200*(num_epoch+1))
-    subset_bins_train_pairs = [bins_train_all_pairs[bin_idx] for bin_idx in range(min(num_epoch+1, len(bins_train_all_pairs)))]
+    #### Test
     sync_embeddings()
     new_tkn_results, new_tkns_per_qst = evals.compute_evals(llm, new_tokenizer, num_samples=100)
-    diffs = {k: old_tkn_results[k] - new_tkn_results[k] for k in new_tkn_results.keys()}
+    diffs = {k: round(old_tkn_results[k] - new_tkn_results[k], 1) for k in new_tkn_results.keys()}
     if num_epoch == 0:
         logger.info(f"{old_tkns_per_qst=}, {new_tkns_per_qst=}")
     wandb.log(diffs)
-    tqdm_bar = tqdm(range(args.num_iters_per_epoch), ncols=100, leave=False)
-    train_losses, valid_losses = [], []
+
+    #### Train
+    tqdm_bar = tqdm(range(args.num_iters_per_epoch), ncols=100, leave=True)
+    # Select only bins with length < (200*(num_epoch+1))
+    subset_bins_train_pairs = [bins_train_all_pairs[bin_idx] for bin_idx in range(min(num_epoch+1, len(bins_train_all_pairs)))]
+    train_losses = []
     for num_iter in tqdm_bar:
         # Choose a random list of samples of similar length
         random_subset = random.choices(subset_bins_train_pairs, weights=[len(x) for x in subset_bins_train_pairs], k=1)[0]
         # Choose N samples from that list
         train_batch_pairs = random.choices(random_subset, k=args.batch_size)
         train_loss = compute_loss(train_batch_pairs, do_backward=True)
-        if num_iter % 10 == 0:
-            with torch.no_grad():
-                valid_batch_pairs = random.choices(valid_all_pairs, k=args.batch_size)
-                valid_loss = compute_loss(valid_batch_pairs, do_backward=False)
-            wandb.log({"train_loss": train_loss, "valid_loss": valid_loss})
-            train_losses.append(train_loss)
-            valid_losses.append(valid_loss)
-            desc = f"{num_epoch=:>2}, avg_train_loss={np.mean(train_losses):.1f}, avg_valid_loss={np.mean(valid_losses):.1f}"
-            tqdm_bar.desc =desc
-            break
+        wandb.log({"train_loss": train_loss})
+        train_losses.append(train_loss)
+        desc = f"{num_epoch=:>2}, avg_train_loss={np.mean(train_losses):.1f}"
+        tqdm_bar.desc = desc
+
+    #### Valid
+    valid_losses = []
+    for batch_idx in range(0, len(valid_all_pairs), args.batch_size):
+        valid_batch_pairs = valid_all_pairs[batch_idx : batch_idx + args.batch_size]
+        with torch.no_grad():
+            valid_loss = compute_loss(valid_batch_pairs, do_backward=False)
+        valid_losses.append(valid_loss)
     wandb.log({"avg_train_loss": np.mean(train_losses), "avg_valid_loss": np.mean(valid_losses)})
-    logger.info(desc)
+
+    logger.info(f"{num_epoch=:>2}, avg_train_loss={np.mean(train_losses):.1f}, avg_valid_loss={np.mean(valid_losses):.1f}, {diffs}")
     tmp_embeds = {k: deepcopy(v.detach().cpu()) for k, v in learnable_embeddings.items()}
     torch.save(tmp_embeds, log_dir / "learnable_embeddings.pth")
 
