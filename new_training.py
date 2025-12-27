@@ -7,8 +7,10 @@ import numpy as np
 import torch.nn as nn
 from tqdm import tqdm
 from loguru import logger
+from copy import deepcopy
 import torch.nn.functional as F
 from datasets import load_dataset
+from collections import defaultdict
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import evals
@@ -63,7 +65,8 @@ all_pairs = []
 for sample in tqdm(dataset_infinity_instruct['train'].select(random.sample(range(659808), args.num_questions)), desc="Creating Q-A pairs", ncols=100):
     question, answer = sample['conversations'][:2]
     question, answer = question['value'], answer['value']
-    if len(question) + len(answer) < args.max_combined_chars:
+    # Avoid Q&A with very long answers and those with too long Q&A
+    if len(answer) < 2 * len(question) and len(question) + len(answer) < args.max_combined_chars:
         all_pairs.append((question, answer))
 
 tmp = len(all_pairs)
@@ -128,7 +131,7 @@ def sync_embeddings():  # Set learnable_embeddings into embedding table
 
 def compute_loss(batch_pairs, do_backward):
     losses = []
-    assert old_tokenizer.padding_side == "right"
+    old_tokenizer.padding_side = new_tokenizer.padding_side = "right"
     qq_chats = [old_tokenizer.apply_chat_template([{"role": "user", "content": q}], tokenize=False, enable_thinking=False) for q, a in batch_pairs]
     qa_chats = [old_tokenizer.apply_chat_template([{"role": "user", "content": q}, {"role": "assistant", "content": a}], tokenize=False, enable_thinking=False) for q, a in batch_pairs]
     qq_new_tkns = new_tokenizer(qq_chats, return_tensors='pt', padding=True).to(args.device)
@@ -138,21 +141,22 @@ def compute_loss(batch_pairs, do_backward):
         with torch.no_grad():
             all_teacher_outputs = llm(**qa_old_tkns, output_hidden_states=args.loss_type=="codi")
             all_teacher_logits = all_teacher_outputs.logits
- 
+
     for num_sample, (q, a) in enumerate(batch_pairs):
         sample_qq_attn_msk = qq_new_tkns.attention_mask[num_sample]
         sample_qq_new_tkns = qq_new_tkns.input_ids[num_sample][:sample_qq_attn_msk.sum()]
-        qq_chat = old_tokenizer.apply_chat_template([{"role": "user", "content": q}], tokenize=False, enable_thinking=False)
-        assert (sample_qq_new_tkns == new_tokenizer(qq_chat, return_tensors='pt').input_ids.to(args.device)).all()
+        # qq_chat = old_tokenizer.apply_chat_template([{"role": "user", "content": q}], tokenize=False, enable_thinking=False)
+        # assert (sample_qq_new_tkns == new_tokenizer(qq_chat, return_tensors='pt').input_ids.to(args.device)).all()
         aa_old_tkns = qa_old_tkns.input_ids[num_sample, qq_old_tkns.attention_mask[num_sample].sum():qa_old_tkns.attention_mask[num_sample].sum()]
         qq_new_aa_old_tkns = torch.cat([sample_qq_new_tkns, aa_old_tkns])
-        student_inputs_embeds = llm.get_input_embeddings()(qq_new_aa_old_tkns)
-        for num_token in zip(*torch.where(sample_qq_new_tkns >= len_old_tokenizer)):
-            tkn_id = int(sample_qq_new_tkns[num_token])
-            assert tkn_id in new_token_ids
-            assert tkn_id >= len_old_tokenizer
-            student_inputs_embeds[num_token] = learnable_embeddings[int(tkn_id)].type(args.dtype)
+
         with torch.amp.autocast(device_type=str(llm.device), dtype=llm.dtype):
+            student_inputs_embeds = llm.get_input_embeddings()(qq_new_aa_old_tkns)
+            for num_token in zip(*torch.where(sample_qq_new_tkns >= len_old_tokenizer)):
+                tkn_id = int(sample_qq_new_tkns[num_token])
+                assert tkn_id in new_token_ids
+                assert tkn_id >= len_old_tokenizer
+                student_inputs_embeds[num_token] = learnable_embeddings[int(tkn_id)].type(args.dtype)
             student_outputs = llm(inputs_embeds=student_inputs_embeds.unsqueeze(0), output_hidden_states=args.loss_type=="codi")
             student_logits = student_outputs.logits
         teacher_logits = all_teacher_logits[num_sample][:qa_old_tkns.attention_mask[num_sample].sum()]  # Remove paddings
@@ -160,9 +164,7 @@ def compute_loss(batch_pairs, do_backward):
         # Remove logits and hidden states of non-answer tokens
         student_logits = student_logits[:, -len(aa_old_tkns):]
         teacher_logits = teacher_logits[-len(aa_old_tkns):].unsqueeze(0)
-        print(student_logits.sum())
-        print(teacher_logits.sum())
-
+        
         if args.loss_type == "mse":
             loss = F.mse_loss(student_logits, teacher_logits)
         elif args.loss_type == "smoothl1":
@@ -173,7 +175,7 @@ def compute_loss(batch_pairs, do_backward):
             teacher_probs = torch.nn.functional.softmax(teacher_logits / T, dim=-1)
             loss = F.kl_div(student_probs, teacher_probs, reduction='batchmean') * (T * T)
         elif args.loss_type == "codi":
-            teacher_hidden_states = teacher_outputs.hidden_states
+            teacher_hidden_states = all_teacher_outputs.hidden_states[num_sample, :qa_old_tkns.attention_mask[num_sample].sum()]
             student_hidden_states = student_outputs.hidden_states
             student_hidden_states = [hstate[:, -len(aa_old_tkns):] for hstate in student_hidden_states]
             teacher_hidden_states = [hstate[:, -len(aa_old_tkns):] for hstate in teacher_hidden_states]
@@ -188,36 +190,52 @@ def compute_loss(batch_pairs, do_backward):
         losses.append(loss.item())
     optimizer.step()
     optimizer.zero_grad()
-    exit()
     return np.mean(losses)
 
+bins_train_all_pairs = defaultdict(list)
+for q, a in train_all_pairs:
+    bins_train_all_pairs[(len(q) + len(a)) // 200].append((q, a))
+
+bins_train_all_pairs = sorted(list(bins_train_all_pairs.values()), key=lambda x: len(x[0][0]) + len(x[0][1]))
+bins_train_all_pairs = [l for l in bins_train_all_pairs if len(l) >= args.batch_size]
+logger.info(f"There are {len(bins_train_all_pairs)} bins, with Q&A from length {len(str(bins_train_all_pairs[0][0]))} to {len(str(bins_train_all_pairs[-1][0]))}")
+
+old_tkn_results, old_tkns_per_qst = evals.compute_evals(llm, old_tokenizer, num_samples=500)
 for num_epoch in range(args.num_epochs):
+    # Select only bins with length < (200*(num_epoch+1))
+    subset_bins_train_pairs = [bins_train_all_pairs[bin_idx] for bin_idx in range(min(num_epoch+1, len(bins_train_all_pairs)))]
     sync_embeddings()
-    # old_tkn_results, old_tkns_per_qst = evals.compute_evals(llm, old_tokenizer, num_samples=100)
-    # new_tkn_results, new_tkns_per_qst = evals.compute_evals(llm, new_tokenizer, num_samples=100)
-    # diffs = {k: old_tkn_results[k] - new_tkn_results[k] for k in new_tkn_results.keys()}
-    # if num_epoch == 0:
-    #     logger.info(f"{old_tkns_per_qst=}, {new_tkns_per_qst=}")
-    # wandb.log(diffs)
+    new_tkn_results, new_tkns_per_qst = evals.compute_evals(llm, new_tokenizer, num_samples=100)
+    diffs = {k: old_tkn_results[k] - new_tkn_results[k] for k in new_tkn_results.keys()}
+    if num_epoch == 0:
+        logger.info(f"{old_tkns_per_qst=}, {new_tkns_per_qst=}")
+    wandb.log(diffs)
     tqdm_bar = tqdm(range(args.num_iters_per_epoch), ncols=100, leave=False)
     train_losses, valid_losses = [], []
     for num_iter in tqdm_bar:
-        train_batch_pairs = random.choices(train_all_pairs, k=args.batch_size)
+        # Choose a random list of samples of similar length
+        random_subset = random.choices(subset_bins_train_pairs, weights=[len(x) for x in subset_bins_train_pairs], k=1)[0]
+        # Choose N samples from that list
+        train_batch_pairs = random.choices(random_subset, k=args.batch_size)
         train_loss = compute_loss(train_batch_pairs, do_backward=True)
         if num_iter % 10 == 0:
             with torch.no_grad():
                 valid_batch_pairs = random.choices(valid_all_pairs, k=args.batch_size)
                 valid_loss = compute_loss(valid_batch_pairs, do_backward=False)
-            wandb.log({"train_losses": train_loss, "valid_losses": valid_loss})
+            wandb.log({"train_loss": train_loss, "valid_loss": valid_loss})
             train_losses.append(train_loss)
             valid_losses.append(valid_loss)
-            tqdm_bar.desc = f"train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}"
-    wandb.log({"train_loss": np.mean(train_losses), "valid_loss": np.mean(valid_losses)})
-    logger.info(f"{num_epoch=:>2}, train_losses = {np.mean(train_losses):.3f}, valid_loss = {np.mean(valid_losses):.3f}")
+            desc = f"{num_epoch=:>2}, avg_train_loss={np.mean(train_losses):.1f}, avg_valid_loss={np.mean(valid_losses):.1f}"
+            tqdm_bar.desc =desc
+            break
+    wandb.log({"avg_train_loss": np.mean(train_losses), "avg_valid_loss": np.mean(valid_losses)})
+    logger.info(desc)
+    tmp_embeds = {k: deepcopy(v.detach().cpu()) for k, v in learnable_embeddings.items()}
+    torch.save(tmp_embeds, log_dir / "learnable_embeddings.pth")
 
 old_tkn_results, old_tkns_per_qst = evals.compute_evals(llm, old_tokenizer, num_samples=1000)
 new_tkn_results, new_tkns_per_qst = evals.compute_evals(llm, new_tokenizer, num_samples=1000)
-diffs = {k: old_tkn_results[k] - new_tkn_results[k] for k in new_tkn_results.keys()}
+diffs = {k: round(old_tkn_results[k] - new_tkn_results[k], 1) for k in new_tkn_results.keys()}
 logger.info(f"FINAL RESULTS: {old_tkn_results=}")
 logger.info(f"FINAL RESULTS: {new_tkn_results=}")
 logger.info(f"FINAL RESULTS: {diffs=}")

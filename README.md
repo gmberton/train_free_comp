@@ -2,6 +2,8 @@
 
 TODO
 
+add tricks like grad clipping
+
 there are multiple losses that could be used.
     Distillation loss on answer logits (CODI).
     Distillation on activations on answer tokens.
@@ -27,6 +29,8 @@ losses
 LRs
 MCC
 BS
+
+ONE PROBLEM: I should also train it with its own outputs. Also with thinking. Otherwise it won't be good at thinking
 
 
 parser.add_argument("-lt", "--loss_type", type=str, default="mse", choices=['mse', 'smoothl1', 'kl', 'codi'], help="_")
